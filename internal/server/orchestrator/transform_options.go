@@ -39,6 +39,14 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 
 	if transformOptions.ForceArrayStop {
 		newReq.Stop = forceArrayStop(newReq.Stop)
+
+		// Legacy /v1/completions requests keep their stop value in Completion.Stop,
+		// which the outbound completion transformer reads instead of req.Stop.
+		if newReq.Completion != nil {
+			completion := *newReq.Completion
+			completion.Stop = forceArrayStop(completion.Stop)
+			newReq.Completion = &completion
+		}
 	}
 
 	if transformOptions.ReplaceDeveloperRoleWithSystem {
