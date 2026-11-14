@@ -22,6 +22,7 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 
 	if !transformOptions.ForceArrayInstructions &&
 		!transformOptions.ForceArrayInputs &&
+		!transformOptions.ForceArrayStop &&
 		!transformOptions.ReplaceDeveloperRoleWithSystem {
 		return req
 	}
@@ -34,6 +35,10 @@ func applyTransformOptions(req *llm.Request, channelSettings *objects.ChannelSet
 
 	if transformOptions.ForceArrayInputs {
 		newReq.TransformOptions.ArrayInputs = lo.ToPtr(true)
+	}
+
+	if transformOptions.ForceArrayStop {
+		newReq.Stop = forceArrayStop(newReq.Stop)
 	}
 
 	if transformOptions.ReplaceDeveloperRoleWithSystem {
@@ -116,6 +121,17 @@ func applyReasoningEffortMapping(req *llm.Request, channelSettings *objects.Chan
 	}
 
 	return &newReq
+}
+
+// forceArrayStop rewrites a single stop sequence into the array form.
+// OpenAI accepts both forms, but strict OpenAI-compatible upstreams reject the
+// string form with HTTP 400, so such channels can opt into the array form.
+func forceArrayStop(stop *llm.Stop) *llm.Stop {
+	if stop == nil || stop.Stop == nil {
+		return stop
+	}
+
+	return &llm.Stop{MultipleStop: []string{*stop.Stop}}
 }
 
 // replaceDeveloperRoleWithSystem replaces developer role with system in messages.
