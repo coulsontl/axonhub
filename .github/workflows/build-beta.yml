@@ -19,7 +19,7 @@ on:
       pr_branch:
         description: 'Pull-request branch to merge on top of upstream unstable'
         required: false
-        default: 'fix/anthropic-terminal-usage-with-choices'
+        default: 'feat/force-array-stop'
         type: string
 
 permissions:
