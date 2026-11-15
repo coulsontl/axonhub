@@ -15,6 +15,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/build"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/events"
 )
 
 const (
@@ -39,9 +40,9 @@ type fieldGate struct {
 }
 
 var fieldGates = []fieldGate{
-	{name: "events", message: errEventsNotEnabled},
-	{name: "hooks.request", message: errRequestHooksNotEnabled},
-	{name: "hooks.attempt", message: errRequestHooksNotEnabled},
+	{name: "events", open: true, message: errEventsNotEnabled},
+	{name: "hooks.request", open: true, message: errRequestHooksNotEnabled},
+	{name: "hooks.attempt", open: true, message: errRequestHooksNotEnabled},
 	{name: "hooks.response", message: errResponseHooksNotEnabled},
 	{name: "hooks.streamChunk", message: errResponseHooksNotEnabled},
 	{name: "ui.panels", message: errUIPanelsNotEnabled},
@@ -79,28 +80,31 @@ var ReservedPluginIDs = map[string]struct{}{
 	"axonhub.webhook": {},
 }
 
-// ManifestDiff is the set of permissions, events, hooks, and pages the new
-// manifest declares and the old one did not. Name, version, description,
-// axonhubVersion, entry, and title changes are not included.
+// ManifestDiff is the set of permissions, network rules, events, hooks, and
+// UI contributions the new manifest declares and the old one did not. Name, version,
+// description, axonhubVersion, entry, and title changes are not included.
 type ManifestDiff struct {
 	Permissions []string
+	Network     []string
 	Events      []string
 	Hooks       []string
 	Pages       []string
+	Actions     []string
 }
 
 // NeedsPreview reports whether an enabled plugin must ask the owner before upgrade.
 // The enabled check itself belongs to the install transaction.
 func (d ManifestDiff) NeedsPreview() bool {
-	return len(d.Permissions) > 0 || len(d.Events) > 0 || len(d.Hooks) > 0 || len(d.Pages) > 0
+	return len(d.Permissions) > 0 || len(d.Network) > 0 || len(d.Events) > 0 || len(d.Hooks) > 0 || len(d.Pages) > 0 || len(d.Actions) > 0
 }
 
 // UpgradePlan is the pure result of comparing two manifests.
 // Callers write it in their own transaction.
 type UpgradePlan struct {
-	Diff    ManifestDiff
-	Granted []string
-	Config  map[string]any
+	Diff           ManifestDiff
+	Granted        []string
+	GrantedNetwork []string
+	Config         map[string]any
 }
 
 // ParseManifest decodes manifest JSON and validates it against axonhubVersion.
@@ -139,6 +143,9 @@ func ValidateManifest(manifest *objects.PluginManifest, axonhubVersion string) e
 	if err := checkPermissions(manifest.Permissions); err != nil {
 		return err
 	}
+	if err := checkEvents(manifest.Events); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -157,9 +164,11 @@ func DiffManifest(old, next *objects.PluginManifest) ManifestDiff {
 	}
 	return ManifestDiff{
 		Permissions: addedStrings(next.Permissions, old.Permissions),
+		Network:     addedStrings(next.NetworkGrants(), old.NetworkGrants()),
 		Events:      addedStrings(next.Events, old.Events),
 		Hooks:       addedHooks(old.Hooks, next.Hooks),
 		Pages:       addedStrings(pageKeys(next.UI), pageKeys(old.UI)),
+		Actions:     addedActions(old.UI, next.UI),
 	}
 }
 
@@ -168,6 +177,16 @@ func DiffManifest(old, next *objects.PluginManifest) ManifestDiff {
 // the result is the intersection of oldGrant and declared, with nothing new added.
 // A non-nil submitted slice is the full new grant and must be a subset of declared.
 func ConvergePermissions(oldGrant []string, declared []string, submitted *[]string) ([]string, error) {
+	return convergeGrant(oldGrant, declared, submitted, "permission")
+}
+
+// ConvergeNetwork applies the same intersection and full-set rules as permissions.
+// Tokens are the declared URL string or the regex source, compared exactly.
+func ConvergeNetwork(oldGrant []string, declared []string, submitted *[]string) ([]string, error) {
+	return convergeGrant(oldGrant, declared, submitted, "network rule")
+}
+
+func convergeGrant(oldGrant []string, declared []string, submitted *[]string, kind string) ([]string, error) {
 	declaredSet := lo.SliceToMap(declared, func(item string) (string, struct{}) {
 		return item, struct{}{}
 	})
@@ -193,7 +212,7 @@ func ConvergePermissions(oldGrant []string, declared []string, submitted *[]stri
 	seen := make(map[string]struct{}, len(*submitted))
 	for _, item := range *submitted {
 		if _, ok := declaredSet[item]; !ok {
-			return nil, fmt.Errorf("granted permission %q is not declared by the plugin", item)
+			return nil, fmt.Errorf("granted %s %q is not declared by the plugin", kind, item)
 		}
 		if _, dup := seen[item]; dup {
 			continue
@@ -238,15 +257,13 @@ func MigrateConfig(old map[string]any, schema *objects.PluginConfigSchema) (map[
 		return nil, err
 	}
 	migrated := make(map[string]any, len(schema.Properties))
-	for name, prop := range schema.Properties {
-		value, ok := old[name]
-		if !ok {
-			continue
+	for name := range schema.Properties {
+		if value, ok := old[name]; ok {
+			migrated[name] = value
 		}
-		if err := prop.CheckValue(value); err != nil {
-			return nil, fmt.Errorf("config field %q is not compatible with the new schema: %s", name, err.Error())
-		}
-		migrated[name] = value
+	}
+	if err := validateConfigValues(schema, migrated, false); err != nil {
+		return nil, fmt.Errorf("config is not compatible with the new schema: %w", err)
 	}
 	encoded, err := encodeConfig(migrated)
 	if err != nil {
@@ -260,12 +277,17 @@ func MigrateConfig(old map[string]any, schema *objects.PluginConfigSchema) (map[
 
 // PrepareUpgrade runs the shared upgrade checks. It does not write the database.
 // A failure returns no plan, so the previous config is left untouched.
-func PrepareUpgrade(old, next *objects.PluginManifest, oldGrant []string, oldConfig map[string]any, submitted *[]string) (*UpgradePlan, error) {
+// A nil submitted or submittedNetwork pointer converges that grant with the new declaration.
+func PrepareUpgrade(old, next *objects.PluginManifest, oldGrant []string, oldNetwork []string, oldConfig map[string]any, submitted *[]string, submittedNetwork *[]string) (*UpgradePlan, error) {
 	if old == nil || next == nil {
 		return nil, errors.New("manifest is required")
 	}
 	diff := DiffManifest(old, next)
 	granted, err := ConvergePermissions(oldGrant, next.Permissions, submitted)
+	if err != nil {
+		return nil, err
+	}
+	network, err := ConvergeNetwork(oldNetwork, next.NetworkGrants(), submittedNetwork)
 	if err != nil {
 		return nil, err
 	}
@@ -277,9 +299,10 @@ func PrepareUpgrade(old, next *objects.PluginManifest, oldGrant []string, oldCon
 		return nil, err
 	}
 	return &UpgradePlan{
-		Diff:    diff,
-		Granted: granted,
-		Config:  migrated,
+		Diff:           diff,
+		Granted:        granted,
+		GrantedNetwork: network,
+		Config:         migrated,
 	}, nil
 }
 
@@ -298,9 +321,9 @@ func closedFieldPresent(manifest *objects.PluginManifest, name string) bool {
 	case "events":
 		return manifest.EventsPresent
 	case "hooks.request":
-		return manifest.Hooks != nil && manifest.Hooks.Request
+		return manifest.Hooks != nil && manifest.Hooks.Request.IsEnabled()
 	case "hooks.attempt":
-		return manifest.Hooks != nil && manifest.Hooks.Attempt
+		return manifest.Hooks != nil && manifest.Hooks.Attempt.IsEnabled()
 	case "hooks.response":
 		return manifest.Hooks != nil && manifest.Hooks.ResponsePresent
 	case "hooks.streamChunk":
@@ -347,6 +370,26 @@ func normalizeAxonHubVersion(raw string) (*semver.Version, error) {
 		return nil, fmt.Errorf("invalid AxonHub version %q", raw)
 	}
 	return normalized, nil
+}
+
+func checkEvents(names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	allowed := lo.SliceToMap(events.OpenEventTypes(), func(name string) (string, struct{}) {
+		return name, struct{}{}
+	})
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("event %q is duplicated", name)
+		}
+		seen[name] = struct{}{}
+		if _, ok := allowed[name]; !ok {
+			return fmt.Errorf("event %q is not enabled", name)
+		}
+	}
+	return nil
 }
 
 func checkPermissions(permissions []string) error {
@@ -398,11 +441,11 @@ func addedStrings(next, prev []string) []string {
 
 func addedHooks(old, next *objects.PluginHooksSpec) []string {
 	added := make([]string, 0, 2)
-	if hookEnabled(next, "request") && !hookEnabled(old, "request") {
-		added = append(added, "request")
+	if hookEnabled(next, "request") && (!hookEnabled(old, "request") || len(addedStrings(hookScope(next, "request"), hookScope(old, "request"))) > 0) {
+		added = append(added, "request: "+strings.Join(hookScope(next, "request"), ", "))
 	}
-	if hookEnabled(next, "attempt") && !hookEnabled(old, "attempt") {
-		added = append(added, "attempt")
+	if hookEnabled(next, "attempt") && (!hookEnabled(old, "attempt") || len(addedStrings(hookScope(next, "attempt"), hookScope(old, "attempt"))) > 0) {
+		added = append(added, "attempt: "+strings.Join(hookScope(next, "attempt"), ", "))
 	}
 	if len(added) == 0 {
 		return nil
@@ -416,9 +459,9 @@ func hookEnabled(hooks *objects.PluginHooksSpec, name string) bool {
 	}
 	switch name {
 	case "request":
-		return hooks.Request
+		return hooks.Request.IsEnabled()
 	case "attempt":
-		return hooks.Attempt
+		return hooks.Attempt.IsEnabled()
 	default:
 		return false
 	}
@@ -441,4 +484,42 @@ func encodeConfig(config map[string]any) ([]byte, error) {
 		return nil, fmt.Errorf("config cannot be encoded: %w", err)
 	}
 	return encoded, nil
+}
+
+func hookScope(h *objects.PluginHooksSpec, name string) []string {
+	var out []string
+	if h == nil {
+		return out
+	}
+	if name == "request" && h.Request != nil {
+		for _, v := range h.Request.RequestTypes {
+			out = append(out, string(v))
+		}
+	}
+	if name == "attempt" && h.Attempt != nil {
+		for _, v := range h.Attempt.APIFormats {
+			out = append(out, string(v))
+		}
+	}
+	return out
+}
+
+func addedActions(old, next *objects.PluginUI) []string {
+	var added []string
+	if next == nil {
+		return added
+	}
+	previous := map[string]objects.PluginUIAction{}
+	if old != nil {
+		for _, action := range old.Actions {
+			previous[action.Key] = action
+		}
+	}
+	for _, action := range next.Actions {
+		before, ok := previous[action.Key]
+		if !ok || before.Slot != action.Slot || before.Effect.Type != action.Effect.Type {
+			added = append(added, action.Key)
+		}
+	}
+	return added
 }

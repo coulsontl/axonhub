@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useRouter } from '@tanstack/react-router';
+import { nanoid } from 'nanoid';
 import { useTranslation } from 'react-i18next';
 import { toast } from 'sonner';
-import { Button } from '@/components/ui/button';
-import { useTheme } from '@/context/theme-context';
-import { ensureFreshAccessToken } from '@/lib/auth-session';
 import { useSelectedProjectId } from '@/stores/projectStore';
+import { ensureFreshAccessToken } from '@/lib/auth-session';
+import { useTheme } from '@/context/theme-context';
+import { Button } from '@/components/ui/button';
 import { createPluginUISession, pluginFrameSrc, type PluginUISession } from '../data/plugin-ui';
 import {
   PLUGIN_UI_PROTOCOL,
@@ -14,8 +15,12 @@ import {
   bridgeError,
   isPluginSitePath,
   matchPluginBridgeMessage,
+  pluginFetchCallParams,
+  pluginFetchHTTPError,
+  pluginFetchResult,
   pluginHTTPBridgeError,
   pluginProjectId,
+  readPluginUITokens,
   resolvePluginTheme,
   type PluginBridgeMatch,
 } from '../plugin-ui';
@@ -30,11 +35,12 @@ const TOASTS = {
   error: toast.error,
 } as const;
 
-interface PluginFrameProps {
+type PluginFrameProps = {
   pluginId: string;
-  pageKey: string;
   entry: string;
-}
+  title?: string;
+  onNavigate?: () => void;
+} & ({ pageKey: string; actionKey?: never } | { pageKey?: never; actionKey: string });
 
 interface FrameSession {
   id: string;
@@ -44,15 +50,12 @@ interface FrameSession {
   helloTimer: number;
 }
 
-export function PluginFrame({ pluginId, pageKey, entry }: PluginFrameProps) {
+export function PluginFrame(props: PluginFrameProps) {
   const [attempt, setAttempt] = useState(0);
   return (
     <PluginFrameAttempt
-      key={`${pluginId}:${pageKey}:${entry}:${attempt}`}
-      pluginId={pluginId}
-      pageKey={pageKey}
-      entry={entry}
-      attempt={attempt}
+      key={`${props.pluginId}:${props.actionKey ? 'action' : 'page'}:${props.actionKey ?? props.pageKey}:${props.entry}:${attempt}`}
+      {...props}
       onRetry={() => setAttempt((value) => value + 1)}
     />
   );
@@ -61,19 +64,24 @@ export function PluginFrame({ pluginId, pageKey, entry }: PluginFrameProps) {
 function PluginFrameAttempt({
   pluginId,
   pageKey,
+  actionKey,
   entry,
-  attempt,
+  title,
+  onNavigate,
   onRetry,
-}: PluginFrameProps & { attempt: number; onRetry: () => void }) {
+}: PluginFrameProps & { onRetry: () => void }) {
   const { t, i18n } = useTranslation();
   const { theme, colorScheme } = useTheme();
-  const selectedProjectId = useSelectedProjectId();
+  const currentProjectId = useSelectedProjectId();
+  const selectedProjectId = actionKey === undefined ? currentProjectId : null;
+  const [instanceId] = useState(() => nanoid());
   const router = useRouter();
   const [prefersDark, setPrefersDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
   const [failed, setFailed] = useState(false);
   const sessionQuery = useQuery({
-    queryKey: ['plugin-ui-session', pluginId, entry, attempt],
-    queryFn: () => createPluginUISession(pluginId, entry),
+    queryKey: ['plugin-ui-session', pluginId, entry, instanceId],
+    queryFn: ({ signal }) => createPluginUISession(pluginId, entry, signal),
+    gcTime: 0,
     retry: false,
     refetchOnWindowFocus: false,
     refetchOnReconnect: false,
@@ -105,16 +113,25 @@ function PluginFrameAttempt({
     return () => media.removeEventListener('change', onChange);
   }, []);
 
-  function initPayload() {
-    const data = sessionDataRef.current;
+  function themePayload() {
     return {
       theme: themeRef.current.theme,
       colorScheme: themeRef.current.colorScheme,
+      tokens: readPluginUITokens(window.getComputedStyle(document.documentElement)),
+    };
+  }
+
+  function initPayload() {
+    const data = sessionDataRef.current;
+    return {
+      ...themePayload(),
       locale: localeRef.current,
       projectId: pluginProjectId(projectRef.current),
-      page: pageKeyRef.current,
+      page: pageKeyRef.current ?? null,
+      action: actionKey ?? null,
+      context: {},
       panel: null,
-      slot: null,
+      slot: actionKey === undefined ? null : 'app.header.actions',
       config: data?.config ?? {},
       canWriteKV: Boolean(data?.canWriteKV),
     };
@@ -163,7 +180,7 @@ function PluginFrameAttempt({
       previous.abort.abort();
       window.clearTimeout(previous.helloTimer);
     }
-    const id = crypto.randomUUID();
+    const id = nanoid();
     const abort = new AbortController();
     const helloTimer = window.setTimeout(() => {
       const current = sessionRef.current;
@@ -198,7 +215,7 @@ function PluginFrameAttempt({
       reply({ ok: false, error: bridgeError('NOT_READY') });
       return;
     }
-    if (call.method !== 'graphql' && call.method !== 'navigate' && call.method !== 'toast') {
+    if (call.method !== 'graphql' && call.method !== 'navigate' && call.method !== 'toast' && call.method !== 'fetch') {
       reply({ ok: false, error: bridgeError('INVALID_ARGUMENT') });
       return;
     }
@@ -218,6 +235,7 @@ function PluginFrameAttempt({
         return;
       }
       reply({ ok: true, result: null });
+      onNavigate?.();
       return;
     }
     if (call.method === 'toast') {
@@ -233,6 +251,78 @@ function PluginFrameAttempt({
       }
       TOASTS[kind](message);
       reply({ ok: true, result: null });
+      return;
+    }
+    if (call.method === 'fetch') {
+      const outbound = pluginFetchCallParams(call.params);
+      if (!outbound) {
+        reply({ ok: false, error: bridgeError('INVALID_ARGUMENT') });
+        return;
+      }
+      const requestPluginId = pluginId;
+      const requestProjectId = selectedProjectId;
+      const timeoutSignal = AbortSignal.timeout(CALL_TIMEOUT_MS);
+      const signal = AbortSignal.any([session.abort.signal, timeoutSignal]);
+      try {
+        const token = await ensureFreshAccessToken();
+        if (session.disposed || sessionRef.current?.id !== session.id || signal.aborted) {
+          return;
+        }
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        }
+        if (requestProjectId) {
+          headers['X-Project-ID'] = requestProjectId;
+        }
+        const response = await fetch(`/admin/plugins/${encodeURIComponent(requestPluginId)}/fetch`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(outbound),
+          signal,
+        });
+        if (session.disposed || sessionRef.current?.id !== session.id) {
+          return;
+        }
+        if (!response.ok) {
+          let payload: unknown = null;
+          try {
+            payload = await response.json();
+          } catch {
+            payload = null;
+          }
+          if (session.disposed || sessionRef.current?.id !== session.id) {
+            return;
+          }
+          reply({ ok: false, error: pluginFetchHTTPError(response.status, payload) });
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = await response.json();
+        } catch {
+          reply({ ok: false, error: bridgeError('INTERNAL', response.status) });
+          return;
+        }
+        if (session.disposed || sessionRef.current?.id !== session.id) {
+          return;
+        }
+        const result = pluginFetchResult(payload);
+        if (!result) {
+          reply({ ok: false, error: bridgeError('INTERNAL', response.status) });
+          return;
+        }
+        reply({ ok: true, result });
+      } catch {
+        if (session.disposed || sessionRef.current?.id !== session.id) {
+          return;
+        }
+        if (timeoutSignal.aborted) {
+          reply({ ok: false, error: bridgeError('TIMEOUT') });
+          return;
+        }
+        reply({ ok: false, error: bridgeError('NETWORK_ERROR') });
+      }
       return;
     }
 
@@ -349,33 +439,52 @@ function PluginFrameAttempt({
   }, []);
 
   useEffect(() => {
-    const session = sessionRef.current;
-    const frame = iframeRef.current?.contentWindow;
-    if (!session?.ready || session.disposed || !frame) {
-      return;
-    }
-    const next = themeRef.current;
-    const previous = lastThemeRef.current;
-    if (previous && previous.theme === next.theme && previous.colorScheme === next.colorScheme) {
-      return;
-    }
-    lastThemeRef.current = next;
-    frame.postMessage(
-      {
-        protocol: PLUGIN_UI_PROTOCOL,
-        version: PLUGIN_UI_VERSION,
-        type: 'theme',
-        sessionId: session.id,
-        payload: { theme: next.theme, colorScheme: next.colorScheme },
-      },
-      '*'
-    );
+    // ThemeProvider writes the theme class in its own effect, which runs after
+    // this child effect. Read the computed values in a microtask so the class
+    // is already on <html>.
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) {
+        return;
+      }
+      const session = sessionRef.current;
+      const frame = iframeRef.current?.contentWindow;
+      if (!session?.ready || session.disposed || !frame) {
+        return;
+      }
+      const next = themeRef.current;
+      const previous = lastThemeRef.current;
+      if (previous && previous.theme === next.theme && previous.colorScheme === next.colorScheme) {
+        return;
+      }
+      const payload = themePayload();
+      lastThemeRef.current = { theme: payload.theme, colorScheme: payload.colorScheme };
+      frame.postMessage(
+        {
+          protocol: PLUGIN_UI_PROTOCOL,
+          version: PLUGIN_UI_VERSION,
+          type: 'theme',
+          sessionId: session.id,
+          payload,
+        },
+        '*'
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [resolvedTheme, colorScheme]);
 
   if (sessionQuery.isError || failed) {
     return (
-      <div data-testid='plugin-frame-error' role='alert' className='flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6'>
-        <p className='text-muted-foreground text-center text-lg'>{t('plugins.page.error')}</p>
+      <div
+        data-testid='plugin-frame-error'
+        role='alert'
+        className='flex h-full min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6'
+      >
+        <p className='text-muted-foreground text-center text-lg'>
+          {t(actionKey === undefined ? 'plugins.page.error' : 'plugins.actions.error')}
+        </p>
         <Button data-testid='plugin-frame-retry' onClick={onRetry}>
           {t('plugins.page.retry')}
         </Button>
@@ -384,18 +493,17 @@ function PluginFrameAttempt({
   }
 
   if (!sessionQuery.data) {
-    return (
-      <div className='text-muted-foreground flex h-full min-h-0 flex-1 items-center justify-center p-6'>{t('plugins.loading')}</div>
-    );
+    return <div className='text-muted-foreground flex h-full min-h-0 flex-1 items-center justify-center p-6'>{t('plugins.loading')}</div>;
   }
 
   return (
     <iframe
       ref={iframeRef}
       data-testid='plugin-frame'
-      title={pageKey}
+      title={title ?? pageKey ?? actionKey}
       src={pluginFrameSrc(sessionQuery.data.token, entry)}
-      sandbox='allow-scripts allow-forms'
+      sandbox='allow-scripts allow-forms allow-downloads'
+      allow='clipboard-write'
       referrerPolicy='no-referrer'
       className='h-full min-h-0 w-full flex-1 border-0'
       onLoad={beginSession}

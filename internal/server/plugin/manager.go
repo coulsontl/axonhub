@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MoeForge/moejs"
+	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
 	"go.uber.org/fx"
 
@@ -32,11 +35,14 @@ import (
 	"github.com/looplj/axonhub/internal/pkg/xcache"
 	"github.com/looplj/axonhub/internal/pkg/xcache/live"
 	"github.com/looplj/axonhub/internal/pkg/xerrors"
+	"github.com/looplj/axonhub/internal/pkg/xredis"
+	"github.com/looplj/axonhub/internal/server/biz"
+	"github.com/looplj/axonhub/internal/server/events"
 )
 
 const (
 	pluginBypassReason = "plugin-manager"
-	pluginCacheName    = "axonhub:plugins"
+	pluginCacheName    = "axonhub:plugins:scoped-hooks"
 	pluginRedisChannel = "axonhub:cache:plugins"
 
 	// errDatabasePacketTooLarge is returned when the database rejects the package blob.
@@ -72,6 +78,7 @@ var pluginMetaColumns = []string{
 	entplugin.FieldEnabled,
 	entplugin.FieldPriority,
 	entplugin.FieldGrantedPermissions,
+	entplugin.FieldGrantedNetwork,
 	entplugin.FieldConfig,
 }
 
@@ -92,15 +99,18 @@ type RuntimeStatusEntry struct {
 	Reason   string
 }
 
-// UpgradePreview is returned when an enabled plugin gains permissions, events, hooks, or pages.
+// UpgradePreview is returned when an enabled plugin gains permissions, network
+// rules, events, hooks, pages, or actions.
 // Nothing is written until a later Install submits the full new grant.
 type UpgradePreview struct {
 	CurrentVersion string
 	NewVersion     string
 	Permissions    []string
+	Network        []string
 	Events         []string
 	Hooks          []string
 	Pages          []string
+	Actions        []string
 }
 
 // InstallResult is a new or upgraded row, or a preview that left the current row running.
@@ -128,8 +138,11 @@ type Manager struct {
 
 	refreshInterval time.Duration
 	extract         func(data []byte, dest string) ([]string, error)
-	forceNext       atomic.Bool
-	packageReads    atomic.Int64
+	// compileModule, when set, replaces compileContents for a package that
+	// contains plugin.js. Tests count calls and inject failures.
+	compileModule func(data []byte) (*moejs.Module, error)
+	forceNext     atomic.Bool
+	packageReads  atomic.Int64
 
 	refreshMu   sync.Mutex
 	resourcesMu sync.Mutex
@@ -144,15 +157,56 @@ type Manager struct {
 	builtins  map[string]Builtin
 
 	// cacheMode is ManagerParams.Cache.Mode. Empty is stored as memory.
-	// Counters are per instance unless this is two-level.
+	// Counters are per instance unless this is redis or two-level.
 	cacheMode string
+
+	counterMu      sync.Mutex
+	countersClosed bool
+	redis          redis.UniversalClient
+	memCounters    *memoryCounters
+	writes         *pluginWriteLimiter
+	channels       *biz.ChannelService
+	webhooks       *biz.WebhookNotifier
+	dispatcher     *eventDispatcher
 
 	// kvNow is the clock for KV expiry. Nil means time.Now.
 	// Tests in this package may set it.
 	kvNow func() time.Time
 
+	// outboundTransport, when set, handles ctx.fetch and the page fetch route.
+	// Nil uses http.DefaultTransport. Redirects are never followed.
+	outboundTransport http.RoundTripper
+
+	// callNow is the clock for the circuit breaker. Nil means time.Now.
+	// Tests in this package may set it. It is not the KV clock.
+	callNow func() time.Time
+
+	// marketHTTP, when set, fetches the market index and packages.
+	// Nil uses http.DefaultTransport. The index URL stays MarketIndexURL.
+	marketHTTP *http.Client
+	// marketNow is the clock for the market index cache. Nil means time.Now.
+	marketNow   func() time.Time
+	marketMu    sync.Mutex
+	marketCache *marketIndexCache
+
+	execMu sync.Mutex
+	execs  map[int]*pluginExec
+
+	hookMu       sync.Mutex
+	hookCounters map[int]hookCounter
+	// hookTimeout overrides the 10s request-hook budget. Zero uses the default.
+	// Tests set it so a timeout case does not wait the full budget.
+	hookTimeout time.Duration
+
 	stopOnce sync.Once
 	stopErr  error
+}
+
+// hookCounter holds process-local request-hook counters for one installation.
+type hookCounter struct {
+	overloaded     int64
+	protectedDrops int64
+	overridden     int64
 }
 
 type managerConfig struct {
@@ -165,8 +219,11 @@ type managerConfig struct {
 type ManagerParams struct {
 	fx.In
 
-	Client *ent.Client
-	Cache  xcache.Config
+	Client   *ent.Client
+	Cache    xcache.Config
+	Bus      *events.Bus
+	Channels *biz.ChannelService
+	Webhooks *biz.WebhookNotifier
 }
 
 // NewManager creates the process temp root, watcher, and cache, then loads metadata.
@@ -208,8 +265,22 @@ func newManager(params ManagerParams, cfg managerConfig) (*Manager, error) {
 		resources:       map[resourceKey]*pluginResource{},
 		builtins:        map[string]Builtin{},
 		cacheMode:       cacheMode,
+		execs:           map[int]*pluginExec{},
+		writes:          newPluginWriteLimiter(),
+		channels:        params.Channels,
+		webhooks:        params.Webhooks,
 	}
 	manager.callsCond = sync.NewCond(&manager.callsMu)
+	if manager.countersUseRedis() {
+		redisClient, err := xredis.NewClient(params.Cache.Redis)
+		if err != nil {
+			_ = os.RemoveAll(tempRoot)
+			return nil, fmt.Errorf("plugin counter redis: %w", err)
+		}
+		manager.redis = redisClient
+	} else {
+		manager.memCounters = newMemoryCounters()
+	}
 
 	watcherMode := cacheMode
 	if watcherMode == xcache.ModeTwoLevel {
@@ -223,10 +294,14 @@ func newManager(params ManagerParams, cfg managerConfig) (*Manager, error) {
 		Buffer:       32,
 	})
 	if err != nil {
+		manager.closeRedis()
 		_ = os.RemoveAll(tempRoot)
 		return nil, fmt.Errorf("plugin watcher init failed: %w", err)
 	}
 	manager.notifier = notifier
+	if params.Bus != nil {
+		manager.dispatcher = newEventDispatcher(manager, params.Bus)
+	}
 
 	initial := newGeneration(manager, nil)
 	manager.cache = live.NewCache(live.Options[*Generation]{
@@ -239,7 +314,11 @@ func newManager(params ManagerParams, cfg managerConfig) (*Manager, error) {
 		Watcher:         notifier,
 	})
 	if err := manager.cache.Load(context.Background(), true); err != nil {
+		if manager.dispatcher != nil {
+			manager.dispatcher.close()
+		}
 		manager.cache.Stop()
+		manager.closeRedis()
 		_ = os.RemoveAll(tempRoot)
 		return nil, fmt.Errorf("load plugins: %w", err)
 	}
@@ -268,6 +347,9 @@ func (m *Manager) stop(ctx context.Context) error {
 	m.callsMu.Lock()
 	m.stopping = true
 	m.callsMu.Unlock()
+	if m.dispatcher != nil {
+		m.dispatcher.close()
+	}
 	// Wait for any extraction already in progress before deleting its directories.
 	m.refreshMu.Lock()
 	defer m.refreshMu.Unlock()
@@ -294,9 +376,12 @@ func (m *Manager) stop(ctx context.Context) error {
 		release.releaseResources()
 	}
 	if err := m.waitCalls(ctx); err != nil {
+		m.closeRedis()
 		return err
 	}
+	m.closeExecs()
 	m.syncBuiltins(context.Background(), gen, nil)
+	m.closeRedis()
 	if m.tempRoot == "" {
 		return nil
 	}
@@ -344,13 +429,13 @@ func (m *Manager) IsBuiltin(pluginID string) bool {
 	return ok
 }
 
-// CountersArePerInstance is true unless this process cache mode is two-level.
-// An empty mode is stored as memory, so counters stay per instance.
+// CountersArePerInstance is true unless this process shares counters through Redis.
+// redis and two-level use the shared counter. An empty mode is stored as memory.
 func (m *Manager) CountersArePerInstance() bool {
 	if m == nil {
 		return true
 	}
-	return m.cacheMode != xcache.ModeTwoLevel
+	return m.cacheMode != xcache.ModeTwoLevel && m.cacheMode != xcache.ModeRedis
 }
 
 // RegisterBuiltin adds a package-less plugin. An empty registry is a no-op.
@@ -391,9 +476,25 @@ func (m *Manager) PackageReads() int64 {
 	return m.packageReads.Load()
 }
 
-// VMCount is always zero until a later task creates JavaScript VMs.
+// VMCount is the number of JavaScript runtimes this process holds for every
+// plugin, idle and borrowed. A compiled module is not a runtime.
 func (m *Manager) VMCount() int {
-	return 0
+	if m == nil {
+		return 0
+	}
+	m.execMu.Lock()
+	execs := make([]*pluginExec, 0, len(m.execs))
+	for _, exec := range m.execs {
+		execs = append(execs, exec)
+	}
+	m.execMu.Unlock()
+	count := 0
+	for _, exec := range execs {
+		exec.mu.Lock()
+		count += exec.borrowed + len(exec.idle)
+		exec.mu.Unlock()
+	}
+	return count
 }
 
 // RuntimeStatuses returns this process's in-memory status for the current generation.
@@ -416,9 +517,13 @@ func (m *Manager) RuntimeStatuses() []RuntimeStatusEntry {
 }
 
 // Install parses a package and either inserts a disabled row or upgrades the active row.
-// submitted == nil means the caller did not send a grant. A non-nil slice, including
-// an empty one, is the full new grant for an upgrade. New installs ignore submitted.
-func (m *Manager) Install(ctx context.Context, zip []byte, submitted *[]string) (*InstallResult, error) {
+// submitted == nil means the caller did not send a permission grant. A non-nil slice,
+// including an empty one, is the full new permission grant for an upgrade.
+// New installs ignore submitted permissions.
+// submittedNetwork == nil converges the previous network grant with the new manifest.
+// A new install has no previous grant, so that result is empty. A non-nil network
+// slice is the full new grant and must be a subset of manifest.network.
+func (m *Manager) Install(ctx context.Context, zip []byte, submitted *[]string, submittedNetwork *[]string) (*InstallResult, error) {
 	pkg, err := ParsePackage(zip)
 	if err != nil {
 		return nil, err
@@ -430,15 +535,23 @@ func (m *Manager) Install(ctx context.Context, zip []byte, submitted *[]string) 
 		return nil, err
 	}
 	if len(rows) == 0 {
-		return m.insertPlugin(ctx, zip, pkg)
+		return m.insertPlugin(ctx, zip, pkg, submittedNetwork)
 	}
 	if len(rows) > 1 {
 		return nil, fmt.Errorf("plugin %q has more than one active row", pkg.Manifest.ID)
 	}
-	return m.upgradePlugin(ctx, rows[0], zip, pkg, submitted)
+	return m.upgradePlugin(ctx, rows[0], zip, pkg, submitted, submittedNetwork)
 }
 
-func (m *Manager) insertPlugin(ctx context.Context, zip []byte, pkg *Package) (*InstallResult, error) {
+func (m *Manager) insertPlugin(ctx context.Context, zip []byte, pkg *Package, submittedNetwork *[]string) (*InstallResult, error) {
+	network := []string{}
+	if submittedNetwork != nil {
+		normalized, err := networkSubset(*submittedNetwork, pkg.Manifest.NetworkGrants())
+		if err != nil {
+			return nil, err
+		}
+		network = normalized
+	}
 	var saved *ent.Plugin
 	err := m.runInTx(ctx, func(txCtx context.Context) error {
 		row, err := m.client(txCtx).Plugin.Create().
@@ -451,6 +564,7 @@ func (m *Manager) insertPlugin(ctx context.Context, zip []byte, pkg *Package) (*
 			SetPackageSha256(pkg.SHA256).
 			SetEnabled(false).
 			SetGrantedPermissions([]string{}).
+			SetGrantedNetwork(network).
 			SetConfig(map[string]any{}).
 			Save(txCtx)
 		if err != nil {
@@ -469,7 +583,7 @@ func (m *Manager) insertPlugin(ctx context.Context, zip []byte, pkg *Package) (*
 	return &InstallResult{Plugin: saved}, nil
 }
 
-func (m *Manager) upgradePlugin(ctx context.Context, current pluginRecord, zip []byte, pkg *Package, submitted *[]string) (*InstallResult, error) {
+func (m *Manager) upgradePlugin(ctx context.Context, current pluginRecord, zip []byte, pkg *Package, submitted *[]string, submittedNetwork *[]string) (*InstallResult, error) {
 	var (
 		saved   *ent.Plugin
 		preview *UpgradePreview
@@ -479,11 +593,17 @@ func (m *Manager) upgradePlugin(ctx context.Context, current pluginRecord, zip [
 		if err != nil {
 			return err
 		}
-		plan, err := PrepareUpgrade(&row.Manifest, &pkg.Manifest, row.Granted, row.Config, submitted)
+		plan, err := PrepareUpgrade(&row.Manifest, &pkg.Manifest, row.Granted, row.GrantedNetwork, row.Config, submitted, submittedNetwork)
 		if err != nil {
 			return err
 		}
-		if row.Enabled && plan.Diff.NeedsPreview() && submitted == nil {
+		// An enabled plugin must stay runnable, so a new version that needs config it lacks is applied only while disabled.
+		if row.Enabled {
+			if err := checkConfigForEnable(pkg.Manifest.ConfigSchema, plan.Config); err != nil {
+				return fmt.Errorf("disable the plugin before upgrading, then configure it: %w", err)
+			}
+		}
+		if row.Enabled && plan.Diff.NeedsPreview() && submitted == nil && submittedNetwork == nil {
 			preview = previewFrom(row, pkg, plan.Diff)
 			saved = row.entity()
 			return errUpgradePreview
@@ -496,6 +616,7 @@ func (m *Manager) upgradePlugin(ctx context.Context, current pluginRecord, zip [
 			SetPackage(zip).
 			SetPackageSha256(pkg.SHA256).
 			SetGrantedPermissions(plan.Granted).
+			SetGrantedNetwork(plan.GrantedNetwork).
 			SetConfig(plan.Config).
 			Save(txCtx)
 		if err != nil {
@@ -517,21 +638,31 @@ func (m *Manager) upgradePlugin(ctx context.Context, current pluginRecord, zip [
 	return &InstallResult{Plugin: saved}, nil
 }
 
-// Enable grants a subset of the stored manifest permissions and marks the row enabled.
-func (m *Manager) Enable(ctx context.Context, id int, granted []string) error {
+// Enable grants subsets of the stored manifest permissions and network rules,
+// then marks the row enabled. Both slices are the complete new grants.
+// It fails while any configSchema.required field is missing.
+func (m *Manager) Enable(ctx context.Context, id int, granted []string, grantedNetwork []string) error {
 	ctx = authz.WithSystemBypass(ctx, pluginBypassReason)
 	err := m.runInTx(ctx, func(txCtx context.Context) error {
 		row, err := m.oneRecord(txCtx, id)
 		if err != nil {
 			return err
 		}
+		if err := checkConfigForEnable(row.Manifest.ConfigSchema, row.Config); err != nil {
+			return err
+		}
 		normalized, err := permissionsSubset(granted, row.Manifest.Permissions)
+		if err != nil {
+			return err
+		}
+		network, err := networkSubset(grantedNetwork, row.Manifest.NetworkGrants())
 		if err != nil {
 			return err
 		}
 		return m.client(txCtx).Plugin.UpdateOneID(id).
 			SetEnabled(true).
 			SetGrantedPermissions(normalized).
+			SetGrantedNetwork(network).
 			Exec(txCtx)
 	})
 	if err != nil {
@@ -540,7 +671,7 @@ func (m *Manager) Enable(ctx context.Context, id int, granted []string) error {
 	return m.finishWrite(ctx)
 }
 
-// Disable keeps the row and drops this process's copy of its UI files on the next refresh.
+// Disable keeps the row and drops this process's UI files and compiled module on the next refresh.
 func (m *Manager) Disable(ctx context.Context, id int) error {
 	ctx = authz.WithSystemBypass(ctx, pluginBypassReason)
 	err := m.runInTx(ctx, func(txCtx context.Context) error {
@@ -556,6 +687,7 @@ func (m *Manager) Disable(ctx context.Context, id int) error {
 }
 
 // UpdateSettings validates config against the stored schema and saves priority and config.
+// An enabled plugin must keep every required field set; a disabled one may save partial config.
 func (m *Manager) UpdateSettings(ctx context.Context, id int, priority int, config map[string]any) error {
 	ctx = authz.WithSystemBypass(ctx, pluginBypassReason)
 	err := m.runInTx(ctx, func(txCtx context.Context) error {
@@ -566,6 +698,11 @@ func (m *Manager) UpdateSettings(ctx context.Context, id int, priority int, conf
 		config = keepSecretValues(row.Manifest.ConfigSchema, row.Config, config)
 		if err := validateStoredConfig(row.Manifest.ConfigSchema, config); err != nil {
 			return err
+		}
+		if row.Enabled {
+			if err := checkConfigForEnable(row.Manifest.ConfigSchema, config); err != nil {
+				return err
+			}
 		}
 		return m.client(txCtx).Plugin.UpdateOneID(id).
 			SetPriority(priority).
@@ -681,6 +818,9 @@ func (m *Manager) onSwap(old, next *Generation) {
 		m.retire(old)
 	}
 	m.syncBuiltins(context.Background(), old, next)
+	if m.dispatcher != nil {
+		m.dispatcher.sync(next)
+	}
 }
 
 func (m *Manager) retire(gen *Generation) {
@@ -809,7 +949,30 @@ func (m *Manager) resourceFor(ctx context.Context, row pluginRecord, prev *Loade
 func (m *Manager) publishResource(resource *pluginResource, data []byte) error {
 	resource.mu.Lock()
 	resource.ready = false
+	resource.module = nil
+	resource.hasPluginJS = false
 	resource.mu.Unlock()
+
+	contents, err := readPackage(data)
+	if err != nil {
+		return err
+	}
+	var module *moejs.Module
+	if contents.hasPluginJS() {
+		if m.compileModule != nil {
+			module, err = m.compileModule(data)
+		} else {
+			module, err = compileContents(contents)
+		}
+		if err != nil {
+			return err
+		}
+		if module == nil {
+			return errors.New("plugin.js did not compile")
+		}
+	} else if err := rejectDisallowed(contents, nil); err != nil {
+		return err
+	}
 
 	finalDir := filepath.Join(m.tempRoot, strconv.Itoa(resource.key.id), resource.key.sha)
 	staging := finalDir + ".staging"
@@ -832,7 +995,9 @@ func (m *Manager) publishResource(resource *pluginResource, data []byte) error {
 
 	extract := m.extract
 	if extract == nil {
-		extract = ExtractPackageUI
+		extract = func(_ []byte, dest string) ([]string, error) {
+			return writePreparedUI(data, dest, contents.uiFiles, contents.dirs)
+		}
 	}
 	files, err := extract(data, staging)
 	if err != nil {
@@ -847,13 +1012,12 @@ func (m *Manager) publishResource(resource *pluginResource, data []byte) error {
 		cleanupStaging()
 		return fmt.Errorf("publish plugin directory: %w", err)
 	}
-	if err := syncDir(filepath.Dir(finalDir)); err != nil {
-		return err
-	}
 
 	resource.mu.Lock()
 	resource.dir = finalDir
 	resource.files = files
+	resource.module = module
+	resource.hasPluginJS = module != nil
 	resource.ready = true
 	resource.mu.Unlock()
 	return nil
@@ -1042,7 +1206,8 @@ func newGeneration(manager *Manager, plugins []*LoadedPlugin) *Generation {
 	return gen
 }
 
-// VMCount is always zero for UI-only packages. A later task owns the JS runtime.
+// VMCount is always zero. Runtimes belong to the process manager, not to a
+// generation. Compiled modules are stored on plugin resources.
 func (g *Generation) VMCount() int {
 	return 0
 }
@@ -1075,6 +1240,16 @@ func (g *Generation) ByPluginID(pluginID string) *LoadedPlugin {
 
 // Acquire pins this generation until Release. A closed generation returns ErrGenerationClosed.
 func (g *Generation) Acquire() error {
+	return g.acquire(false)
+}
+
+// acquirePinned pins a generation a request already captured, including after a
+// refresh has closed it. A stopping manager still rejects the pin.
+func (g *Generation) acquirePinned() error {
+	return g.acquire(true)
+}
+
+func (g *Generation) acquire(allowClosed bool) error {
 	if g == nil || g.manager == nil {
 		return ErrGenerationClosed
 	}
@@ -1084,7 +1259,7 @@ func (g *Generation) Acquire() error {
 		return ErrGenerationClosed
 	}
 	g.mu.Lock()
-	if g.closed {
+	if g.closed && !allowClosed {
 		g.mu.Unlock()
 		g.manager.callsMu.Unlock()
 		return ErrGenerationClosed
@@ -1163,6 +1338,7 @@ type LoadedPlugin struct {
 	Enabled            bool
 	Priority           int
 	GrantedPermissions []string
+	GrantedNetwork     []string
 	Config             map[string]any
 	PackageSHA256      string
 	Status             RuntimeStatus
@@ -1251,11 +1427,22 @@ type pluginResource struct {
 	key     resourceKey
 	manager *Manager
 
-	mu    sync.Mutex
-	dir   string
-	files []string
-	ready bool
-	refs  int
+	mu          sync.Mutex
+	dir         string
+	files       []string
+	ready       bool
+	refs        int
+	hasPluginJS bool
+	module      *moejs.Module
+}
+
+func (r *pluginResource) compiledModule() *moejs.Module {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.module
 }
 
 func (r *pluginResource) hold() {
@@ -1273,11 +1460,17 @@ func (r *pluginResource) release(manager *Manager) {
 	r.refs--
 	last := r.refs == 0
 	dir := r.dir
+	module := r.module
+	if last {
+		r.module = nil
+		r.hasPluginJS = false
+	}
 	r.mu.Unlock()
 	if !last {
 		return
 	}
 	if manager != nil {
+		manager.releaseExecModule(r.key.id, module)
 		manager.resourcesMu.Lock()
 		if manager.resources[r.key] == r {
 			delete(manager.resources, r.key)
@@ -1297,6 +1490,13 @@ func (r *pluginResource) release(manager *Manager) {
 func (r *pluginResource) complete() bool {
 	dir, files, ready := r.snapshot()
 	if !ready || dir == "" {
+		return false
+	}
+	r.mu.Lock()
+	hasJS := r.hasPluginJS
+	module := r.module
+	r.mu.Unlock()
+	if hasJS && module == nil {
 		return false
 	}
 	info, err := os.Stat(dir)
@@ -1367,26 +1567,31 @@ type fingerprintRow struct {
 }
 
 type pluginRecord struct {
-	ID            int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	DeletedAt     int
-	PluginID      string
-	Name          string
-	Version       string
-	Description   string
-	Manifest      objects.PluginManifest
-	PackageSHA256 string
-	Enabled       bool
-	Priority      int
-	Granted       []string
-	Config        map[string]any
+	ID             int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeletedAt      int
+	PluginID       string
+	Name           string
+	Version        string
+	Description    string
+	Manifest       objects.PluginManifest
+	PackageSHA256  string
+	Enabled        bool
+	Priority       int
+	Granted        []string
+	GrantedNetwork []string
+	Config         map[string]any
 }
 
 func (row pluginRecord) loaded() *LoadedPlugin {
 	granted := slices.Clone(row.Granted)
 	if granted == nil {
 		granted = []string{}
+	}
+	network := slices.Clone(row.GrantedNetwork)
+	if network == nil {
+		network = []string{}
 	}
 	config := map[string]any{}
 	maps.Copy(config, row.Config)
@@ -1400,6 +1605,7 @@ func (row pluginRecord) loaded() *LoadedPlugin {
 		Enabled:            row.Enabled,
 		Priority:           row.Priority,
 		GrantedPermissions: granted,
+		GrantedNetwork:     network,
 		Config:             config,
 		PackageSHA256:      row.PackageSHA256,
 	}
@@ -1421,6 +1627,7 @@ func (row pluginRecord) entity() *ent.Plugin {
 		Enabled:            item.Enabled,
 		Priority:           item.Priority,
 		GrantedPermissions: item.GrantedPermissions,
+		GrantedNetwork:     item.GrantedNetwork,
 		Config:             item.Config,
 	}
 }
@@ -1430,9 +1637,11 @@ func previewFrom(row pluginRecord, pkg *Package, diff ManifestDiff) *UpgradePrev
 		CurrentVersion: row.Version,
 		NewVersion:     pkg.Manifest.Version,
 		Permissions:    slices.Clone(diff.Permissions),
+		Network:        slices.Clone(diff.Network),
 		Events:         slices.Clone(diff.Events),
 		Hooks:          slices.Clone(diff.Hooks),
 		Pages:          slices.Clone(diff.Pages),
+		Actions:        slices.Clone(diff.Actions),
 	}
 }
 
@@ -1456,21 +1665,18 @@ func validateStoredConfig(schema *objects.PluginConfigSchema, config map[string]
 	if err := schema.Validate(); err != nil {
 		return err
 	}
-	names := keys(config)
-	slices.Sort(names)
-	for _, name := range names {
-		prop, ok := schema.Properties[name]
-		if !ok {
-			return fmt.Errorf("config field %q is not declared", name)
-		}
-		if err := prop.CheckValue(config[name]); err != nil {
-			return fmt.Errorf("config field %q: %s", name, err.Error())
-		}
-	}
-	return nil
+	return validateConfigValues(schema, config, false)
 }
 
 func permissionsSubset(granted, declared []string) ([]string, error) {
+	return grantSubset(granted, declared, "permission")
+}
+
+func networkSubset(granted, declared []string) ([]string, error) {
+	return grantSubset(granted, declared, "network rule")
+}
+
+func grantSubset(granted, declared []string, kind string) ([]string, error) {
 	declaredSet := lo.SliceToMap(declared, func(item string) (string, struct{}) {
 		return item, struct{}{}
 	})
@@ -1478,7 +1684,7 @@ func permissionsSubset(granted, declared []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(granted))
 	for _, item := range granted {
 		if _, ok := declaredSet[item]; !ok {
-			return nil, fmt.Errorf("granted permission %q is not declared by the plugin", item)
+			return nil, fmt.Errorf("granted %s %q is not declared by the plugin", kind, item)
 		}
 		if _, dup := seen[item]; dup {
 			continue
@@ -1515,14 +1721,6 @@ func validSHA(sha string) bool {
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-func keys(config map[string]any) []string {
-	out := make([]string, 0, len(config))
-	for key := range config {
-		out = append(out, key)
-	}
-	return out
 }
 
 // sqlTime scans the timestamp shapes SQLite and Ent drivers return.

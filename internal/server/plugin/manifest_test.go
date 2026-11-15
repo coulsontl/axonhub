@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/build"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/events"
 )
 
 const validManifestJSON = `{
@@ -20,7 +22,7 @@ const validManifestJSON = `{
   "axonhubVersion": "^1.0.0",
   "pluginApiVersion": 1,
   "permissions": ["read_channels", "webhook"],
-  "hooks": {"request": false, "attempt": false},
+  "hooks": {"request": {"enabled": false}, "attempt": {"enabled": false}},
   "configSchema": {
     "type": "object",
     "properties": {
@@ -42,9 +44,25 @@ func TestManifest(t *testing.T) {
 		manifest, err := ParseManifest([]byte(validManifestJSON), "v1.0.0-beta9")
 		require.NoError(t, err)
 		require.Equal(t, "acme.failover-guard", manifest.ID)
-		require.False(t, manifest.Hooks.Request)
-		require.False(t, manifest.Hooks.Attempt)
+		require.False(t, manifest.Hooks.Request.IsEnabled())
+		require.False(t, manifest.Hooks.Attempt.IsEnabled())
 		require.Contains(t, manifest.ConfigSchema.Properties, "my.custom-prop")
+	})
+
+	t.Run("accepts string array config", func(t *testing.T) {
+		raw := mutateManifest(t, func(t *testing.T, manifest map[string]any) {
+			propertiesOf(t, manifest)["models"] = map[string]any{
+				"type":    "array",
+				"items":   map[string]any{"type": "string"},
+				"default": []any{"gpt-4o"},
+			}
+		})
+		manifest, err := ParseManifest(raw, "v1.0.0-beta9")
+		require.NoError(t, err)
+		models := manifest.ConfigSchema.Properties["models"]
+		require.Equal(t, objects.ConfigTypeArray, models.Type)
+		require.Equal(t, objects.ConfigTypeString, models.Items.Type)
+		require.Equal(t, []any{"gpt-4o"}, models.Default)
 	})
 
 	t.Run("rejects name, version, and description that exceed the column width", func(t *testing.T) {
@@ -67,6 +85,27 @@ func TestManifest(t *testing.T) {
 		require.ErrorContains(t, err, "description must be at most")
 	})
 
+	t.Run("accepts the open event types", func(t *testing.T) {
+		raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+			manifest["events"] = []any{}
+		})
+		manifest, err := ParseManifest(raw, "v1.0.0-beta9")
+		require.NoError(t, err)
+		require.True(t, manifest.EventsPresent)
+		require.Empty(t, manifest.Events)
+
+		names := make([]any, 0, len(events.OpenEventTypes()))
+		for _, name := range events.OpenEventTypes() {
+			names = append(names, name)
+		}
+		raw = mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+			manifest["events"] = names
+		})
+		manifest, err = ParseManifest(raw, "v1.0.0-beta9")
+		require.NoError(t, err)
+		require.Equal(t, events.OpenEventTypes(), manifest.Events)
+	})
+
 	t.Run("accepts every opened permission", func(t *testing.T) {
 		raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
 			manifest["permissions"] = []any{
@@ -84,6 +123,30 @@ func TestManifest(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("configSchema required lists declared properties", func(t *testing.T) {
+		raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+			manifest["configSchema"].(map[string]any)["required"] = []any{"token", "target"}
+		})
+		manifest, err := ParseManifest(raw, "v1.0.0-beta9")
+		require.NoError(t, err)
+		require.Equal(t, []string{"token", "target"}, manifest.ConfigSchema.Required)
+
+		for _, tc := range []struct {
+			required any
+			want     string
+		}{
+			{[]any{"missing"}, "configSchema.required[0] \"missing\" is not a declared property"},
+			{[]any{"token", "token"}, "configSchema.required[1] \"token\" is duplicated"},
+			{"token", "configSchema.required must be an array of strings"},
+		} {
+			raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+				manifest["configSchema"].(map[string]any)["required"] = tc.required
+			})
+			_, err := ParseManifest(raw, "v1.0.0-beta9")
+			require.ErrorContains(t, err, tc.want)
+		}
+	})
+
 	t.Run("omitted optional fields use defaults", func(t *testing.T) {
 		raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
 			delete(manifest, "permissions")
@@ -95,6 +158,7 @@ func TestManifest(t *testing.T) {
 		manifest, err := ParseManifest(raw, "v1.0.0-beta9")
 		require.NoError(t, err)
 		require.Empty(t, manifest.Permissions)
+		require.Empty(t, manifest.Network)
 		require.Nil(t, manifest.Hooks)
 		require.Empty(t, manifest.Description)
 		require.Nil(t, manifest.ConfigSchema)
@@ -298,7 +362,47 @@ func TestManifest(t *testing.T) {
 			mutate: func(t *testing.T, manifest map[string]any) {
 				propertiesOf(t, manifest)["nested"] = map[string]any{"type": "object"}
 			},
-			want: "must be string, integer, number, or boolean",
+			want: "must be string, integer, number, boolean, or array",
+		},
+		{
+			name: "config array requires items",
+			mutate: func(t *testing.T, manifest map[string]any) {
+				propertiesOf(t, manifest)["models"] = map[string]any{"type": "array"}
+			},
+			want: "configSchema.properties.models.items is required for array",
+		},
+		{
+			name: "config array items must be string",
+			mutate: func(t *testing.T, manifest map[string]any) {
+				propertiesOf(t, manifest)["models"] = map[string]any{"type": "array", "items": map[string]any{"type": "integer"}}
+			},
+			want: "configSchema.properties.models.items.type must be string",
+		},
+		{
+			name: "config array default must hold strings",
+			mutate: func(t *testing.T, manifest map[string]any) {
+				propertiesOf(t, manifest)["models"] = map[string]any{
+					"type":    "array",
+					"items":   map[string]any{"type": "string"},
+					"default": []any{"gpt-4o", 1},
+				}
+			},
+			want: "configSchema.properties.models.default: expected array",
+		},
+		{
+			name: "config items only valid for array",
+			mutate: func(t *testing.T, manifest map[string]any) {
+				token := propertiesOf(t, manifest)["token"].(map[string]any)
+				token["items"] = map[string]any{"type": "string"}
+			},
+			want: "configSchema.properties.token.items is only valid for array",
+		},
+		{
+			name: "unknown config items keyword",
+			mutate: func(t *testing.T, manifest map[string]any) {
+				propertiesOf(t, manifest)["models"] = map[string]any{"type": "array", "items": map[string]any{"type": "string", "minLength": 1}}
+			},
+			want: "unknown field configSchema.properties.models.items.minLength",
 		},
 		{
 			name: "config format must be secret",
@@ -423,29 +527,59 @@ func TestManifest(t *testing.T) {
 			mutate: func(_ *testing.T, manifest map[string]any) {
 				manifest["events"] = []any{}
 			},
-			want:    "events are not enabled",
-			notWant: "unknown field",
 		},
 		{
 			name: "events populated",
 			mutate: func(_ *testing.T, manifest map[string]any) {
 				manifest["events"] = []any{"request.failover"}
 			},
-			want: "events are not enabled",
+		},
+		{
+			name: "events channel.auto_disabled",
+			mutate: func(_ *testing.T, manifest map[string]any) {
+				manifest["events"] = []any{"channel.auto_disabled"}
+			},
+			want: `event "channel.auto_disabled" is not enabled`,
+		},
+		{
+			name: "events provider.quota.warning",
+			mutate: func(_ *testing.T, manifest map[string]any) {
+				manifest["events"] = []any{"provider.quota.warning"}
+			},
+			want: `event "provider.quota.warning" is not enabled`,
+		},
+		{
+			name: "events provider.quota.exhausted",
+			mutate: func(_ *testing.T, manifest map[string]any) {
+				manifest["events"] = []any{"provider.quota.exhausted"}
+			},
+			want: `event "provider.quota.exhausted" is not enabled`,
+		},
+		{
+			name: "events duplicated",
+			mutate: func(_ *testing.T, manifest map[string]any) {
+				manifest["events"] = []any{"request.failover", "request.failover"}
+			},
+			want: `event "request.failover" is duplicated`,
+		},
+		{
+			name: "events not an array",
+			mutate: func(_ *testing.T, manifest map[string]any) {
+				manifest["events"] = "request.failover"
+			},
+			want: "events must be an array of strings",
 		},
 		{
 			name: "hooks.request true",
 			mutate: func(t *testing.T, manifest map[string]any) {
-				hooksOf(t, manifest)["request"] = true
+				hooksOf(t, manifest)["request"] = map[string]any{"enabled": true, "requestTypes": []string{"chat"}}
 			},
-			want: "request hooks are not enabled",
 		},
 		{
 			name: "hooks.attempt true",
 			mutate: func(t *testing.T, manifest map[string]any) {
-				hooksOf(t, manifest)["attempt"] = true
+				hooksOf(t, manifest)["attempt"] = map[string]any{"enabled": true, "apiFormats": []string{"openai/chat_completions"}}
 			},
-			want: "request hooks are not enabled",
 		},
 		{
 			name: "hooks.response present",
@@ -560,6 +694,76 @@ func page0(t *testing.T, manifest map[string]any) map[string]any {
 	page, ok := pages[0].(map[string]any)
 	require.True(t, ok)
 	return page
+}
+
+func TestManifestNetwork(t *testing.T) {
+	regex := `^https://api\.example\.com/v1/items/[0-9]+$`
+	raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+		manifest["network"] = []any{
+			"https://example.com/v1/check",
+			map[string]any{"regex": regex},
+		}
+	})
+	manifest, err := ParseManifest(raw, "v1.0.0-beta9")
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://example.com/v1/check", regex}, manifest.NetworkGrants())
+	encoded, err := json.Marshal(manifest.Network)
+	require.NoError(t, err)
+	var again []objects.PluginNetworkRule
+	require.NoError(t, json.Unmarshal(encoded, &again))
+	require.Equal(t, manifest.Network, again)
+
+	rejected := []struct {
+		name string
+		rule any
+		want string
+	}{
+		{name: "bare origin", rule: "https://example.com", want: "path"},
+		{name: "userinfo", rule: "https://user:pw@example.com/v1", want: "userinfo"},
+		{name: "query", rule: "https://example.com/v1?x=1", want: "query"},
+		{name: "fragment", rule: "https://example.com/v1#x", want: "fragment"},
+		{name: "http", rule: "http://example.com/v1", want: "https"},
+		{name: "unanchored regex", rule: map[string]any{"regex": "https://example.com/v1"}, want: "^"},
+		{name: "invalid regex", rule: map[string]any{"regex": "^($"}, want: "invalid"},
+	}
+	for _, item := range rejected {
+		t.Run(item.name, func(t *testing.T) {
+			raw := mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+				manifest["network"] = []any{item.rule}
+			})
+			_, err := ParseManifest(raw, "v1.0.0-beta9")
+			require.ErrorContains(t, err, item.want)
+		})
+	}
+
+	raw = mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+		manifest["network"] = []any{map[string]any{"regex": regex, "url": "https://example.com/v1"}}
+	})
+	_, err = ParseManifest(raw, "v1.0.0-beta9")
+	require.ErrorContains(t, err, "unknown field network[0].url")
+
+	raw = mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+		manifest["network"] = []any{"https://example.com/v1/check", "https://example.com/v1/check"}
+	})
+	_, err = ParseManifest(raw, "v1.0.0-beta9")
+	require.ErrorContains(t, err, "duplicated")
+
+	long := "^" + strings.Repeat("a", objects.MaxPluginNetworkRegex) + "$"
+	raw = mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+		manifest["network"] = []any{map[string]any{"regex": long}}
+	})
+	_, err = ParseManifest(raw, "v1.0.0-beta9")
+	require.ErrorContains(t, err, "256")
+
+	rules := make([]any, objects.MaxPluginNetworkRules+1)
+	for i := range rules {
+		rules[i] = fmt.Sprintf("https://example.com/v1/%d", i)
+	}
+	raw = mutateManifest(t, func(_ *testing.T, manifest map[string]any) {
+		manifest["network"] = rules
+	})
+	_, err = ParseManifest(raw, "v1.0.0-beta9")
+	require.ErrorContains(t, err, "32")
 }
 
 func propertiesOf(t *testing.T, manifest map[string]any) map[string]any {

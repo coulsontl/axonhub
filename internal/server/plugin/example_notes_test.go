@@ -6,7 +6,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,7 +14,7 @@ import (
 )
 
 func TestExampleNotesPackage(t *testing.T) {
-	root := filepath.Join("..", "..", "..", "plugin", "examples", "notes")
+	root := filepath.Join("..", "..", "..", "plugins", "examples", "notes")
 	files := map[string][]byte{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -54,7 +53,7 @@ func TestExampleNotesPackage(t *testing.T) {
 	raw := zipExampleFiles(t, files)
 	assertExampleNotesPackage(t, raw)
 
-	packed := packExampleWithScript(t, root)
+	packed := packExampleDirectory(t, root)
 	assertExampleNotesPackage(t, packed)
 	reader, err := zip.NewReader(bytes.NewReader(packed), int64(len(packed)))
 	require.NoError(t, err)
@@ -81,6 +80,10 @@ func assertExampleNotesPackage(t *testing.T, raw []byte) {
 	require.Equal(t, []string{
 		"manifest.json",
 		"ui/assets/mark.svg",
+		"ui/assets/nanoid/LICENSE",
+		"ui/assets/nanoid/README.md",
+		"ui/assets/nanoid/index.js",
+		"ui/assets/nanoid/url-alphabet/index.js",
 		"ui/notes/app.js",
 		"ui/notes/format.js",
 		"ui/notes/index.html",
@@ -88,17 +91,9 @@ func assertExampleNotesPackage(t *testing.T, raw []byte) {
 	}, pkg.Files)
 }
 
-func packExampleWithScript(t *testing.T, root string) []byte {
+func packExampleDirectory(t *testing.T, root string) []byte {
 	t.Helper()
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 is not installed")
-	}
-	script := filepath.Join("..", "..", "..", "plugin", "scripts", "pack-plugin.py")
-	out := filepath.Join(t.TempDir(), "notes.axplugin")
-	cmd := exec.Command("python3", script, root, "-o", out)
-	output, err := cmd.CombinedOutput()
-	require.NoError(t, err, string(output))
-	packed, err := os.ReadFile(out)
+	packed, _, err := PackDirectory(root)
 	require.NoError(t, err)
 	return packed
 }

@@ -15,7 +15,7 @@ import (
 )
 
 // InstallPlugin is the resolver for the installPlugin field.
-func (r *mutationResolver) InstallPlugin(ctx context.Context, file graphql.Upload, grantedPermissions []string) (*plugin.InstallView, error) {
+func (r *mutationResolver) InstallPlugin(ctx context.Context, file graphql.Upload, grantedPermissions []string, grantedNetwork []string) (*plugin.InstallView, error) {
 	if err := requirePluginOwner(ctx); err != nil {
 		return nil, err
 	}
@@ -32,7 +32,38 @@ func (r *mutationResolver) InstallPlugin(ctx context.Context, file graphql.Uploa
 		granted := append([]string(nil), grantedPermissions...)
 		submitted = &granted
 	}
-	result, err := manager.Install(ctx, data, submitted)
+	var submittedNetwork *[]string
+	if grantedNetwork != nil {
+		network := append([]string(nil), grantedNetwork...)
+		submittedNetwork = &network
+	}
+	result, err := manager.Install(ctx, data, submitted, submittedNetwork)
+	if err != nil {
+		return nil, err
+	}
+	return manager.PresentInstall(result, data)
+}
+
+// InstallPluginFromMarket is the resolver for the installPluginFromMarket field.
+func (r *mutationResolver) InstallPluginFromMarket(ctx context.Context, pluginID string, version string, grantedPermissions []string, grantedNetwork []string) (*plugin.InstallView, error) {
+	if err := requirePluginOwner(ctx); err != nil {
+		return nil, err
+	}
+	manager, err := r.pluginManagerOrErr()
+	if err != nil {
+		return nil, err
+	}
+	var submitted *[]string
+	if grantedPermissions != nil {
+		granted := append([]string(nil), grantedPermissions...)
+		submitted = &granted
+	}
+	var submittedNetwork *[]string
+	if grantedNetwork != nil {
+		network := append([]string(nil), grantedNetwork...)
+		submittedNetwork = &network
+	}
+	result, data, err := manager.InstallFromMarket(ctx, pluginID, version, submitted, submittedNetwork)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +71,7 @@ func (r *mutationResolver) InstallPlugin(ctx context.Context, file graphql.Uploa
 }
 
 // EnablePlugin is the resolver for the enablePlugin field.
-func (r *mutationResolver) EnablePlugin(ctx context.Context, id objects.GUID, grantedPermissions []string) (*plugin.InstalledPlugin, error) {
+func (r *mutationResolver) EnablePlugin(ctx context.Context, id objects.GUID, grantedPermissions []string, grantedNetwork []string) (*plugin.InstalledPlugin, error) {
 	if err := requirePluginOwner(ctx); err != nil {
 		return nil, err
 	}
@@ -52,7 +83,7 @@ func (r *mutationResolver) EnablePlugin(ctx context.Context, id objects.GUID, gr
 	if err != nil {
 		return nil, err
 	}
-	if err := manager.Enable(ctx, rowID, grantedPermissions); err != nil {
+	if err := manager.Enable(ctx, rowID, grantedPermissions, grantedNetwork); err != nil {
 		return nil, err
 	}
 	return manager.Get(ctx, rowID)
@@ -186,6 +217,18 @@ func (r *queryResolver) PluginCountersArePerInstance(ctx context.Context) (bool,
 		return false, err
 	}
 	return manager.CountersArePerInstance(), nil
+}
+
+// PluginMarket is the resolver for the pluginMarket field.
+func (r *queryResolver) PluginMarket(ctx context.Context) ([]*plugin.MarketEntry, error) {
+	if err := requirePluginRead(ctx); err != nil {
+		return nil, err
+	}
+	manager, err := r.pluginManagerOrErr()
+	if err != nil {
+		return nil, err
+	}
+	return manager.MarketCatalog(ctx)
 }
 
 // PluginKv is the resolver for the pluginKV field.

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"errors"
+	"net/http"
+	"strings"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -81,8 +83,10 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		corsConfig.MaxAge = server.Config.CORS.MaxAge
 
 		corsHandler := cors.New(corsConfig)
-		server.Use(corsHandler)
-		server.OPTIONS("*any", corsHandler)
+		// 插件 UI 使用自己的匿名 CORS，原因见 skipCredentialedCORS。
+		credentialedCORS := skipCredentialedCORS(corsHandler)
+		server.Use(credentialedCORS)
+		server.OPTIONS("*any", credentialedCORS)
 	}
 
 	publicGroup := server.Group("", middleware.WithTimeout(server.Config.RequestTimeout))
@@ -95,7 +99,7 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		publicGroup.POST("/auth/invitations/:token/register", handlers.Invitation.Register)
 	}
 
-	unSecureAdminGroup := server.Group("/admin", middleware.WithTimeout(server.Config.RequestTimeout))
+	unSecureAdminGroup := server.Group(adminGroupPath, middleware.WithTimeout(server.Config.RequestTimeout))
 	{
 		// System Status and Initialize - DO NOT AUTH
 		unSecureAdminGroup.GET("/system/status", handlers.System.GetSystemStatus)
@@ -103,8 +107,14 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		// User Login - DO NOT AUTH
 		unSecureAdminGroup.POST("/auth/signin", handlers.Auth.SignIn)
 		unSecureAdminGroup.POST("/auth/refresh", handlers.Auth.Refresh)
-		// The UI token is the credential. GET and HEAD are the only successful
-		// methods; other methods hit the same handler and return 405.
+		// Desktop browser handoff. The one-time code is the credential.
+		// The owner JWT is written into the page and never put in this URL.
+		registerDesktopLoginRoute(unSecureAdminGroup)
+		// The UI token is the credential and only GET/HEAD resources are routed.
+		// Other methods fall through to the default 404 handler. OPTIONS is not
+		// registered here: a root-level OPTIONS("*any") catch-all exists when
+		// CORS is enabled, and Gin panics if a second wildcard is added to that
+		// tree. That catch-all skips this path; see skipCredentialedCORS.
 		registerPluginUIRoutes(unSecureAdminGroup, services.PluginManager, services.SystemService)
 	}
 
@@ -113,7 +123,7 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		handlers.OIDC.RegisterRoutes(oauthGroup)
 	}
 
-	adminGroup := server.Group("/admin", middleware.WithJWTAuth(services.AuthService), middleware.WithProjectID())
+	adminGroup := server.Group(adminGroupPath, middleware.WithJWTAuth(services.AuthService), middleware.WithProjectID())
 	// 管理员路由 - 使用 JWT 认证
 	{
 		adminGroup.GET("/playground", middleware.WithTimeout(server.Config.RequestTimeout), func(c *gin.Context) {
@@ -145,7 +155,6 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 			"/playground/chat",
 			middleware.WithTimeout(server.Config.LLMRequestTimeout),
 			middleware.WithSource(request.SourcePlayground),
-			middleware.WithResponseHeaders(services.RequestService),
 			handlers.Playground.ChatCompletion,
 		)
 
@@ -175,18 +184,20 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		})
 	}
 
-	// Page GraphQL accepts a user JWT only. Service-account keys stay on
-	// /admin/graphql. The 10s budget, rate limit, and response cap belong to
-	// this route and are not applied to the admin GraphQL handler.
-	pluginGraphqlGroup := server.Group(
+	// Page routes accept a user JWT only. Service-account keys stay on
+	// /admin/graphql. GraphQL keeps its 10s budget. Fetch uses the 15s
+	// bridge budget. Neither route has a rate limiter.
+	pluginGroup := server.Group(
 		"/admin/plugins",
 		middleware.WithJWTAuth(services.AuthService),
 		middleware.WithProjectID(),
-		middleware.WithTimeout(gql.PluginGraphqlTimeout),
 	)
 	{
-		pluginGraphqlGroup.POST("/:pluginId/graphql", func(c *gin.Context) {
+		pluginGroup.POST("/:pluginId/graphql", middleware.WithTimeout(gql.PluginGraphqlTimeout), func(c *gin.Context) {
 			handlers.Graphql.PluginGraphql.ServeHTTP(c.Writer, c.Request)
+		})
+		pluginGroup.POST("/:pluginId/fetch", middleware.WithTimeout(gql.PluginFetchTimeout), func(c *gin.Context) {
+			handlers.Graphql.PluginFetch.ServeHTTP(c.Writer, c.Request)
 		})
 	}
 
@@ -213,7 +224,6 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 		middleware.WithIPBlocklist(services.SystemService),
 		middleware.WithAPIKeyConfig(services.AuthService, nil),
 		middleware.WithSource(request.SourceAPI),
-		middleware.WithResponseHeaders(services.RequestService),
 		middleware.WithThread(server.Config.Trace, services.ThreadService),
 		middleware.WithTrace(server.Config.Trace, services.TraceService),
 	}
@@ -295,7 +305,6 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 			middleware.WithIPBlocklist(services.SystemService),
 			middleware.WithGeminiKeyAuth(services.AuthService),
 			middleware.WithSource(request.SourceAPI),
-			middleware.WithResponseHeaders(services.RequestService),
 			middleware.WithThread(server.Config.Trace, services.ThreadService),
 			middleware.WithTrace(server.Config.Trace, services.TraceService),
 		)
@@ -308,7 +317,6 @@ func SetupRoutes(server *Server, handlers Handlers, client *ent.Client, services
 			middleware.WithIPBlocklist(services.SystemService),
 			middleware.WithGeminiKeyAuth(services.AuthService),
 			middleware.WithSource(request.SourceAPI),
-			middleware.WithResponseHeaders(services.RequestService),
 			middleware.WithThread(server.Config.Trace, services.ThreadService),
 			middleware.WithTrace(server.Config.Trace, services.TraceService),
 		)
@@ -340,5 +348,35 @@ func registerPluginUIRoutes(group *gin.RouterGroup, manager *plugin.Manager, sys
 		}
 		plugin.ServePluginUI(c.Writer, c.Request, request)
 	}
-	group.Any("/plugin-ui/:token/*path", handler)
+	// Only GET/HEAD are routed: other methods must not be registered here,
+	// because a root-level OPTIONS("*any") catch-all exists when CORS is
+	// enabled and Gin panics when a second wildcard is added to that tree.
+	group.Handle(http.MethodGet, pluginUIRoutePath, handler)
+	group.Handle(http.MethodHead, pluginUIRoutePath, handler)
+}
+
+const (
+	adminGroupPath    = "/admin"
+	pluginUIPath      = "/plugin-ui/"
+	pluginUIRoutePath = pluginUIPath + ":token/*path"
+)
+
+// skipCredentialedCORS 让插件 UI 不走带凭证的全局 CORS。
+// 插件页面在不带 allow-same-origin 的 sandbox iframe 里，来源是不透明的 null。
+// 模块脚本会发送 Origin: null。gin-contrib/cors 对白名单外的来源会在处理函数之前
+// 直接 403，插件路由自己的 Access-Control-Allow-Origin: * 就写不上去。
+// null 不能加进这份白名单：中间件只接受 http(s) 来源，而且放开 null 会让任意沙箱页面读取带凭证的接口。
+// 这条路径上的 OPTIONS 因此直接返回，响应是空的 200，没有 CORS 头。模块脚本和普通 GET 不会预检。
+// 以后插件如果发送自定义请求头，预检会失败。
+func skipCredentialedCORS(corsHandler gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if isPluginUIResource(c.Request.URL.Path) {
+			return
+		}
+		corsHandler(c)
+	}
+}
+
+func isPluginUIResource(path string) bool {
+	return strings.HasPrefix(path, adminGroupPath+pluginUIPath)
 }

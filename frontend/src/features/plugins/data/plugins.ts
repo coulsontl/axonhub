@@ -17,6 +17,12 @@ const PLUGIN_FIELDS = `
   builtin
   grantedPermissions
   manifestPermissions
+  grantedNetwork
+  manifestNetwork
+  manifestHooks {
+    request { enabled requestTypes }
+    attempt { enabled apiFormats }
+  }
   configFields {
     name
     type
@@ -27,6 +33,7 @@ const PLUGIN_FIELDS = `
     minimum
     maximum
     defaultJSON
+    required
   }
   config
   runtimeStatus
@@ -35,7 +42,15 @@ const PLUGIN_FIELDS = `
 
 const PLUGINS_QUERY = `
   query Plugins {
-    pluginCountersArePerInstance
+    pluginRuntimeStatuses {
+      id
+      pluginID
+      status
+      reason
+      overloaded
+      protectedDrops
+      overriddenByPassThrough
+    }
     plugins {
       ${PLUGIN_FIELDS}
     }
@@ -43,8 +58,8 @@ const PLUGINS_QUERY = `
 `;
 
 const INSTALL_PLUGIN_MUTATION = `
-  mutation InstallPlugin($file: Upload!, $grantedPermissions: [String!]) {
-    installPlugin(file: $file, grantedPermissions: $grantedPermissions) {
+  mutation InstallPlugin($file: Upload!, $grantedPermissions: [String!], $grantedNetwork: [String!]) {
+    installPlugin(file: $file, grantedPermissions: $grantedPermissions, grantedNetwork: $grantedNetwork) {
       plugin {
         ${PLUGIN_FIELDS}
       }
@@ -52,17 +67,19 @@ const INSTALL_PLUGIN_MUTATION = `
         currentVersion
         newVersion
         permissions
+        network
         events
         hooks
         pages
+        actions
       }
     }
   }
 `;
 
 const ENABLE_PLUGIN_MUTATION = `
-  mutation EnablePlugin($id: ID!, $grantedPermissions: [String!]!) {
-    enablePlugin(id: $id, grantedPermissions: $grantedPermissions) {
+  mutation EnablePlugin($id: ID!, $grantedPermissions: [String!]!, $grantedNetwork: [String!]!) {
+    enablePlugin(id: $id, grantedPermissions: $grantedPermissions, grantedNetwork: $grantedNetwork) {
       ${PLUGIN_FIELDS}
     }
   }
@@ -90,6 +107,40 @@ const DELETE_PLUGIN_MUTATION = `
   }
 `;
 
+const PLUGIN_MARKET_QUERY = `
+  query PluginMarket {
+    pluginMarket {
+      id
+      name
+      description
+      version
+      axonhubVersion
+      installedVersion
+      updateFrom
+    }
+  }
+`;
+
+const INSTALL_PLUGIN_FROM_MARKET_MUTATION = `
+  mutation InstallPluginFromMarket($pluginID: String!, $version: String!, $grantedPermissions: [String!], $grantedNetwork: [String!]) {
+    installPluginFromMarket(pluginID: $pluginID, version: $version, grantedPermissions: $grantedPermissions, grantedNetwork: $grantedNetwork) {
+      plugin {
+        ${PLUGIN_FIELDS}
+      }
+      upgradePreview {
+        currentVersion
+        newVersion
+        permissions
+        network
+        events
+        hooks
+        pages
+        actions
+      }
+    }
+  }
+`;
+
 export interface PluginConfigField {
   name: string;
   type: string;
@@ -100,6 +151,36 @@ export interface PluginConfigField {
   minimum?: number | null;
   maximum?: number | null;
   defaultJSON: string;
+  required: boolean;
+}
+
+/** Required fields with no stored value and no default; the server refuses to enable the plugin while any remain. */
+export function missingRequiredConfig(plugin: Plugin): PluginConfigField[] {
+  return plugin.configFields.filter((field) => {
+    if (!field.required) {
+      return false;
+    }
+    const value = plugin.config[field.name];
+    if (value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && value.length === 0)) {
+      return false;
+    }
+    return field.defaultJSON === '' || field.defaultJSON === 'null' || field.defaultJSON === '""' || field.defaultJSON === '[]';
+  });
+}
+
+export interface PluginManifestRequestHook {
+  enabled: boolean;
+  requestTypes: string[];
+}
+
+export interface PluginManifestAttemptHook {
+  enabled: boolean;
+  apiFormats: string[];
+}
+
+export interface PluginManifestHooks {
+  request: PluginManifestRequestHook | null;
+  attempt: PluginManifestAttemptHook | null;
 }
 
 export interface Plugin {
@@ -113,19 +194,37 @@ export interface Plugin {
   builtin: boolean;
   grantedPermissions: string[];
   manifestPermissions: string[];
+  grantedNetwork: string[];
+  manifestNetwork: string[];
+  manifestHooks: PluginManifestHooks;
   configFields: PluginConfigField[];
   config: Record<string, unknown>;
   runtimeStatus: string;
   runtimeError: string;
+  overloaded?: number;
+  protectedDrops?: number;
+  overriddenByPassThrough?: number;
+}
+
+export interface PluginRuntimeStatus {
+  id: string;
+  pluginID: string;
+  status: string;
+  reason: string;
+  overloaded: number;
+  protectedDrops: number;
+  overriddenByPassThrough: number;
 }
 
 export interface PluginUpgradePreview {
   currentVersion: string;
   newVersion: string;
   permissions: string[];
+  network: string[];
   events: string[];
   hooks: string[];
   pages: string[];
+  actions: string[];
 }
 
 export interface PluginInstallResult {
@@ -135,7 +234,21 @@ export interface PluginInstallResult {
 
 export interface PluginsQueryResult {
   plugins: Plugin[];
-  pluginCountersArePerInstance: boolean;
+  pluginRuntimeStatuses: PluginRuntimeStatus[];
+}
+
+export interface PluginMarketEntry {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  axonhubVersion: string;
+  installedVersion: string | null;
+  updateFrom: string | null;
+}
+
+export interface PluginMarketQueryResult {
+  pluginMarket: PluginMarketEntry[];
 }
 
 export function usePlugins() {
@@ -145,13 +258,17 @@ export function usePlugins() {
   });
 }
 
-export async function installPlugin(file: File, grantedPermissions: string[] | null): Promise<PluginInstallResult> {
+export async function installPlugin(
+  file: File,
+  grantedPermissions: string[] | null,
+  grantedNetwork: string[] | null
+): Promise<PluginInstallResult> {
   const formData = new FormData();
   formData.append(
     'operations',
     JSON.stringify({
       query: INSTALL_PLUGIN_MUTATION,
-      variables: { file: null, grantedPermissions },
+      variables: { file: null, grantedPermissions, grantedNetwork },
     })
   );
   formData.append('map', JSON.stringify({ '0': ['variables.file'] }));
@@ -181,10 +298,55 @@ export async function installPlugin(file: File, grantedPermissions: string[] | n
 export function useInstallPlugin() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ file, grantedPermissions }: { file: File; grantedPermissions: string[] | null }) =>
-      installPlugin(file, grantedPermissions),
+    mutationFn: ({
+      file,
+      grantedPermissions,
+      grantedNetwork,
+    }: {
+      file: File;
+      grantedPermissions: string[] | null;
+      grantedNetwork: string[] | null;
+    }) => installPlugin(file, grantedPermissions, grantedNetwork),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['plugins'] });
+      queryClient.invalidateQueries({ queryKey: ['pluginMarket'] });
+      queryClient.invalidateQueries({ queryKey: ['pluginUIEntries'] });
+      queryClient.invalidateQueries({ queryKey: ['plugin-ui-session'] });
+    },
+  });
+}
+
+export function usePluginMarket(enabled = true) {
+  return useQuery({
+    queryKey: ['pluginMarket'],
+    enabled,
+    queryFn: () => graphqlRequest<PluginMarketQueryResult>(PLUGIN_MARKET_QUERY),
+  });
+}
+
+export function useInstallPluginFromMarket() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      pluginID,
+      version,
+      grantedPermissions,
+      grantedNetwork,
+    }: {
+      pluginID: string;
+      version: string;
+      grantedPermissions: string[] | null;
+      grantedNetwork: string[] | null;
+    }) =>
+      graphqlRequest<{ installPluginFromMarket: PluginInstallResult }>(INSTALL_PLUGIN_FROM_MARKET_MUTATION, {
+        pluginID,
+        version,
+        grantedPermissions,
+        grantedNetwork,
+      }).then((data) => data.installPluginFromMarket),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['plugins'] });
+      queryClient.invalidateQueries({ queryKey: ['pluginMarket'] });
       queryClient.invalidateQueries({ queryKey: ['pluginUIEntries'] });
       queryClient.invalidateQueries({ queryKey: ['plugin-ui-session'] });
     },
@@ -194,13 +356,20 @@ export function useInstallPlugin() {
 export function useEnablePlugin() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, grantedPermissions }: { id: string; grantedPermissions: string[] }) =>
-      graphqlRequest<{ enablePlugin: Plugin }>(ENABLE_PLUGIN_MUTATION, { id, grantedPermissions }),
+    mutationFn: ({
+      id,
+      grantedPermissions,
+      grantedNetwork,
+    }: {
+      id: string;
+      grantedPermissions: string[];
+      grantedNetwork: string[];
+    }) => graphqlRequest<{ enablePlugin: Plugin }>(ENABLE_PLUGIN_MUTATION, { id, grantedPermissions, grantedNetwork }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['plugins'] });
+      queryClient.invalidateQueries({ queryKey: ['pluginMarket'] });
       queryClient.invalidateQueries({ queryKey: ['pluginUIEntries'] });
       queryClient.invalidateQueries({ queryKey: ['plugin-ui-session'] });
-      toast.success(i18n.t('plugins.actions.enabled'));
     },
     onError: (error: Error) => {
       toast.error(error.message || i18n.t('plugins.actions.failed'));
@@ -247,6 +416,7 @@ export function useDeletePlugin() {
     mutationFn: (id: string) => graphqlRequest<{ deletePlugin: boolean }>(DELETE_PLUGIN_MUTATION, { id }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['plugins'] });
+      queryClient.invalidateQueries({ queryKey: ['pluginMarket'] });
       queryClient.invalidateQueries({ queryKey: ['pluginUIEntries'] });
       queryClient.invalidateQueries({ queryKey: ['plugin-ui-session'] });
       toast.success(i18n.t('plugins.actions.deleted'));
